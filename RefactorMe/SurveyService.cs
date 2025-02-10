@@ -7,20 +7,32 @@ namespace RefactorMe;
 
 public class SurveyService
 {
+    private readonly AppDbContext _db;
+
+    // Program.cs в проекте нет, поэтому предполагаю, что прописывать в DI-контейнере зависимости в рамках задачи не требуется
+    public SurveyService(AppDbContext db)
+    {
+        _db = db;
+    }
+
     /// <summary>
     /// Получение опросов для пользователя
     /// </summary>
     public async Task<SurveyDto[]> GetSurveys(int userId)
     {
-        await using var db = new AppDbContext();
-
-        return await db.Surveys
+        // Оптимизировали запрос для большого количества данных, так как до этого использовали Any внутри Where.
+        // Если знаем, что данных немного, можно оставить как было.
+        return await _db.Surveys
             .Include(x => x.Questions)
-            .Where(x => x.IsActive && !db.SurveyResults.Any(sr => sr.UserId == userId && sr.SurveyId == x.Id))
+            .GroupJoin(_db.SurveyResults.Where(sr => sr.UserId == userId),
+                survey => survey.Id,
+                result => result.SurveyId,
+                (survey, results) => new { survey, results })
+            .Where(x => x.survey.IsActive && !x.results.Any())
             .Select(x => new SurveyDto()
             {
-                Id = x.Id,
-                Questions = x.Questions
+                Id = x.survey.Id,
+                Questions = x.survey.Questions
                     .Select(q => new SurveyDto.SurveyQuestionDto()
                     {
                         Id = q.Id,
@@ -35,35 +47,60 @@ public class SurveyService
     /// </summary>
     public async Task SaveAnswers(SurveyAnswersDto value)
     {
-        await using var db = new AppDbContext();
-        await using var tr = await db.Database.BeginTransactionAsync();
+        await using var tr = await _db.Database.BeginTransactionAsync();
 
-        var questions = db.SurveyQuestions;
-
-        var s = 0;
-        foreach (var v in value.Answers)
+        if (value.Answers == null || value.Answers.Length == 0)
         {
-            var q = questions.First(x => x.Id == v.QuestionId);
+            throw new ArgumentException("Ответы не могут быть пустыми.");
+        }
 
-            if (q.AnswerType == SurveyQuestion.QuestionAnswerType.Boolean && (bool)v.Value == true)
+        var questions = await _db.SurveyQuestions
+            .Where(q => value.Answers.Select(a => a.QuestionId).Contains(q.Id))
+            .ToListAsync();
+
+        if (questions.Count != value.Answers.Length)
+        {
+            throw new ArgumentException("Некоторые вопросы не найдены.");
+        }
+
+        int score = 0;
+
+        foreach (var answer in value.Answers)
+        {
+            var question = questions.FirstOrDefault(q => q.Id == answer.QuestionId);
+            if (question == null)
             {
-                s++;
+                throw new ArgumentException($"Вопрос с ID {answer.QuestionId} не найден.");
             }
-            else if (q.AnswerType == SurveyQuestion.QuestionAnswerType.Number && (int)v.Value > q.NumberMin)
+
+            switch (question.AnswerType)
             {
-                s++;
+                case SurveyQuestion.QuestionAnswerType.Boolean:
+                    if (bool.TryParse(answer.Value, out bool boolValue) && boolValue)
+                        score++;
+                    break;
+
+                case SurveyQuestion.QuestionAnswerType.Number:
+                    if (int.TryParse(answer.Value, out int intValue) && intValue > question.NumberMin)
+                        score++;
+                    break;
+
+                case SurveyQuestion.QuestionAnswerType.SingleChoice:
+                    if (int.TryParse(answer.Value, out int selectedId) && question.CorrectAnswerId == selectedId)
+                        score++;
+                    break;
             }
         }
 
-        await db.SurveyResults.AddAsync(new SurveyResult()
+        await _db.SurveyResults.AddAsync(new SurveyResult()
         {
             UserId = value.UserId,
             SurveyId = value.SurveyId,
-            Score = s,
-            CreatedAt = DateTime.Now
+            Score = score,
+            CreatedAt = DateTime.UtcNow
         });
 
-        await db.SaveChangesAsync();
+        await _db.SaveChangesAsync();
         await tr.CommitAsync();
     }
 }

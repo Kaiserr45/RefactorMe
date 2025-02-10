@@ -5,7 +5,7 @@ public class SurveyAnswersDto
     public class SurveyAnswerDto
     {
         public int QuestionId { get; set; }
-        public object Value { get; set; }
+        public string Value { get; set; }
     }
 
     public int UserId { get; set; }
